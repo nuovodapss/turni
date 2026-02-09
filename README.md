@@ -38,11 +38,4 @@ Le assenze inserite nella tab **Assenze** sono vincoli hard:
 - se in un giorno c’è `MAL`/`104`/`FERIE`/`ASP`, quel giorno **non può essere** M/P/N
 - la cella viene forzata al codice di assenza
 
-## Dataset demo
-Nella sidebar trovi **Carica esempio** (12 infermieri, coperture modeste, alcune assenze).
-È perfetto per fare una demo al capo:
-1) genera turni
-2) locka qualche cella
-3) inserisci nuove assenze
-4) premi Repair → vedrai che cambia solo il necessario.
 
