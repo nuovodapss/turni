@@ -1,0 +1,375 @@
+"""
+solver.py
+CP-SAT (OR-Tools) per Nurse Rostering con modalità:
+- GENERA: crea una soluzione (con baseline "R" o matrice attuale)
+- REPAIR: minimizza cambiamenti rispetto alla matrice baseline (matrice corrente), rispettando LOCK e ASSENZE.
+
+Nota: questa è una Beta dimostrativa: focalizzata su vincoli hard + obiettivi principali.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, List, Tuple, Optional, Any
+
+from ortools.sat.python import cp_model
+
+from models import Scenario, iso
+
+
+@dataclass
+class SolveResult:
+    status: str  # "OPTIMAL"|"FEASIBLE"|"INFEASIBLE"|"MODEL_INVALID"|"UNKNOWN"
+    objective_value: Optional[int] = None
+    schedule: Optional[Dict[str, Dict[str, str]]] = None
+    diagnostics: List[str] = None
+
+
+def _status_name(status: int) -> str:
+    if status == cp_model.OPTIMAL:
+        return "OPTIMAL"
+    if status == cp_model.FEASIBLE:
+        return "FEASIBLE"
+    if status == cp_model.INFEASIBLE:
+        return "INFEASIBLE"
+    if status == cp_model.MODEL_INVALID:
+        return "MODEL_INVALID"
+    return "UNKNOWN"
+
+
+def quick_diagnostics(scenario: Scenario) -> List[str]:
+    """
+    Diagnostica "pre-solver" molto semplice, utile in demo per spiegare infeasible.
+    Non sostituisce l'analisi completa, ma dà messaggi leggibili.
+    """
+    scenario.ensure_matrices()
+    msgs: List[str] = []
+    days = scenario.dates()
+    nurses = scenario.nurses
+    req = scenario.coverage
+    work_states = ["M", "P", "N"]
+
+    for d in days:
+        di = iso(d)
+        reqM, reqP, reqN = req.min_M, req.min_P, req.min_N
+        if scenario.day_is_weekend_or_holiday(d):
+            reqM = req.weekend_min_M if req.weekend_min_M is not None else reqM
+            reqP = req.weekend_min_P if req.weekend_min_P is not None else reqP
+            reqN = req.weekend_min_N if req.weekend_min_N is not None else reqN
+
+        forced_abs = 0
+        locked_work = 0
+        locked_counts = {"M": 0, "P": 0, "N": 0}
+        for n in nurses:
+            a = scenario.absences.get(n.id, {}).get(di, "")
+            if a:
+                forced_abs += 1
+            if scenario.locks.get(n.id, {}).get(di, False):
+                s = scenario.schedule.get(n.id, {}).get(di, "R")
+                if s in work_states:
+                    locked_work += 1
+                    locked_counts[s] += 1
+
+        available_for_work = max(0, len(nurses) - forced_abs)
+        if (reqM + reqP + reqN) > available_for_work:
+            msgs.append(
+                f"{di}: richiesta M+P+N={reqM+reqP+reqN} > disponibili={available_for_work} "
+                f"(assenze forzate={forced_abs})."
+            )
+        # Se lock crea già una copertura minima "troppo bassa" per una specifica fascia (p.e. pochi M)
+        if locked_counts["M"] > 0 and locked_counts["M"] > len(nurses):
+            msgs.append(f"{di}: troppi lock su M (impossibile).")
+    return msgs
+
+
+def solve_schedule(
+    scenario: Scenario,
+    mode: str = "repair",
+    time_limit_s: int = 10,
+    random_seed: int = 42,
+) -> SolveResult:
+    """
+    mode:
+      - "generate": usa una baseline debole (di default 'R'), ma se esiste una matrice corrente la usa come baseline
+      - "repair": baseline = matrice corrente, minimizza cambiamenti sulle celle NON lockate
+    """
+    scenario.ensure_matrices()
+    diagnostics = quick_diagnostics(scenario)
+
+    days = scenario.dates()
+    if not days or not scenario.nurses:
+        return SolveResult(status="MODEL_INVALID", diagnostics=["Periodo o lista infermieri vuota."])
+
+    nurses = scenario.nurses
+    nurse_ids = [n.id for n in nurses]
+    day_ids = [iso(d) for d in days]
+
+    # Stati
+    work_states = ["M", "P", "N"]
+    rest_states = ["R", "S"]
+    absence_states = list(scenario.absence_codes)
+
+    # Stati usabili in modello
+    all_states = work_states + rest_states + absence_states
+
+    # Se un codice assenza non è in hours, aggiungilo come 0 ore
+    shift_hours = dict(scenario.shift_hours)
+    for a in absence_states:
+        shift_hours.setdefault(a, 0)
+
+    # Baseline per change-penalty
+    baseline = scenario.schedule  # matrice corrente
+    # in generate, se non c'è baseline significativa, è già piena di "R"
+    # (Scenario.ensure_matrices mette "R" ovunque)
+
+    # Modello
+    model = cp_model.CpModel()
+
+    # Variabili x[nurse, day, state] in {0,1}
+    x: Dict[Tuple[str, str, str], cp_model.IntVar] = {}
+    for nid in nurse_ids:
+        for di in day_ids:
+            # Se assenza forzata in input: l'unico stato consentito è quel codice.
+            forced_abs = scenario.absences.get(nid, {}).get(di, "")
+            allowed_states = all_states
+            if forced_abs:
+                allowed_states = [forced_abs]  # forza
+            for s in all_states:
+                if s in allowed_states:
+                    x[(nid, di, s)] = model.NewBoolVar(f"x_{nid}_{di}_{s}")
+                else:
+                    # stato non consentito: usa variabile fissa a 0 (modellazione semplice)
+                    x[(nid, di, s)] = model.NewConstant(0)
+
+            # Un solo stato al giorno
+            model.Add(sum(x[(nid, di, s)] for s in all_states) == 1)
+
+            # Se non è un'assenza forzata, vietiamo che il solver "inventi" assenze (MAL/104/...)
+            # -> l'assenza deve arrivare dall'input (o da edit manuale, che aggiornerebbe absences)
+            if not forced_abs:
+                for a in absence_states:
+                    model.Add(x[(nid, di, a)] == 0)
+
+            # Locks: se la cella è lockata, deve restare al valore corrente (baseline)
+            if scenario.locks.get(nid, {}).get(di, False):
+                locked_state = scenario.schedule.get(nid, {}).get(di, "R") or "R"
+                # Se lock confligge con assenza forzata, il modello diventerà infeasible (ok, da segnalare)
+                for s in all_states:
+                    if s == locked_state:
+                        model.Add(x[(nid, di, s)] == 1)
+                    else:
+                        model.Add(x[(nid, di, s)] == 0)
+
+    # Copertura minima giornaliera
+    cov = scenario.coverage
+    for d in days:
+        di = iso(d)
+        reqM, reqP, reqN = cov.min_M, cov.min_P, cov.min_N
+        if scenario.day_is_weekend_or_holiday(d):
+            reqM = cov.weekend_min_M if cov.weekend_min_M is not None else reqM
+            reqP = cov.weekend_min_P if cov.weekend_min_P is not None else reqP
+            reqN = cov.weekend_min_N if cov.weekend_min_N is not None else reqN
+
+        model.Add(sum(x[(nid, di, "M")] for nid in nurse_ids) >= reqM)
+        model.Add(sum(x[(nid, di, "P")] for nid in nurse_ids) >= reqP)
+        model.Add(sum(x[(nid, di, "N")] for nid in nurse_ids) >= reqN)
+
+    # Vincoli specifici infermiere (non fa notti / max notti)
+    for n in nurses:
+        if n.non_fa_notti:
+            for di in day_ids:
+                model.Add(x[(n.id, di, "N")] == 0)
+        if n.max_notti is not None:
+            model.Add(sum(x[(n.id, di, "N")] for di in day_ids) <= n.max_notti)
+
+    # Smonto dopo Notte: se d è N allora d+1 deve essere S
+    # E: l'ultimo giorno non può essere N (perché non possiamo imporre S fuori orizzonte)
+    for n in nurses:
+        for idx in range(len(days) - 1):
+            d = days[idx]
+            d1 = days[idx + 1]
+            di, di1 = iso(d), iso(d1)
+            # N -> S
+            model.Add(x[(n.id, di1, "S")] == 1).OnlyEnforceIf(x[(n.id, di, "N")])
+        # ultimo giorno: N vietato
+        model.Add(x[(n.id, day_ids[-1], "N")] == 0)
+
+    # Transizioni vietate (11h o regole custom): x[a] -> not x[b] il giorno dopo
+    forbidden = list(scenario.rules.forbidden_transitions)
+    # Nota: alcune transizioni sono implicitamente gestite (N->S) ma qui lasciamo la possibilità di vietare altro.
+    for n in nurses:
+        for idx in range(len(days) - 1):
+            di, di1 = iso(days[idx]), iso(days[idx + 1])
+            for a, b in forbidden:
+                if a not in all_states or b not in all_states:
+                    continue
+                # Se oggi è a, domani non può essere b
+                model.Add(x[(n.id, di1, b)] == 0).OnlyEnforceIf(x[(n.id, di, a)])
+
+    # Riposo settimanale: in ogni finestra di N giorni (default 7) almeno 1 "rest-like"
+    win = scenario.rules.finestra_riposo
+    restlike = set(["R"]) | set(absence_states)
+    if scenario.rules.s_conta_come_riposo:
+        restlike.add("S")
+
+    for n in nurses:
+        for start in range(0, len(days) - win + 1):
+            dias = [iso(days[start + k]) for k in range(win)]
+            model.Add(sum(x[(n.id, di, s)] for di in dias for s in restlike) >= 1)
+
+    # Limite consecutivi lavorati (hard): max_consecutivi_lavorati
+    max_consec = scenario.rules.max_consecutivi_lavorati
+    if max_consec is not None and max_consec >= 1:
+        # in ogni finestra di (max_consec+1) giorni, non posso lavorare tutti i giorni
+        wlen = max_consec + 1
+        for n in nurses:
+            for start in range(0, len(days) - wlen + 1):
+                dias = [iso(days[start + k]) for k in range(wlen)]
+                model.Add(sum(x[(n.id, di, s)] for di in dias for s in work_states) <= max_consec)
+
+    # ---------- OBIETTIVI (soft) ----------
+    weights = scenario.weights
+    obj_terms: List[cp_model.LinearExpr] = []
+
+    # A) Minimizzare cambiamenti rispetto a baseline (repair)
+    if weights.w_change > 0:
+        for nid in nurse_ids:
+            for di in day_ids:
+                # Se lockata o assenza forzata, non la penalizziamo (è hard).
+                if scenario.locks.get(nid, {}).get(di, False):
+                    continue
+                if scenario.absences.get(nid, {}).get(di, ""):
+                    continue
+
+                b = (baseline.get(nid, {}).get(di, "R") or "R")
+                if b not in all_states:
+                    b = "R"
+                # change = 1 se != baseline
+                # Poiché one-hot: change = 1 - x[b]
+                change = model.NewBoolVar(f"chg_{nid}_{di}")
+                model.Add(change + x[(nid, di, b)] == 1)
+                obj_terms.append(weights.w_change * change)
+
+    # Helper: work_today bool
+    work_today: Dict[Tuple[str, str], cp_model.IntVar] = {}
+    for nid in nurse_ids:
+        for di in day_ids:
+            wt = model.NewBoolVar(f"work_{nid}_{di}")
+            model.Add(wt == sum(x[(nid, di, s)] for s in work_states))
+            work_today[(nid, di)] = wt
+
+    # B) Minimizzare consecutivi: penalizza adiacenze lavoro-lavoro (+ triple)
+    if weights.w_adj_work > 0 or weights.w_triple_work > 0:
+        for nid in nurse_ids:
+            for idx in range(len(days) - 1):
+                di, di1 = day_ids[idx], day_ids[idx + 1]
+                pair = model.NewBoolVar(f"pair_{nid}_{di}")
+                # pair = work(di) AND work(di1)
+                model.Add(pair <= work_today[(nid, di)])
+                model.Add(pair <= work_today[(nid, di1)])
+                model.Add(pair >= work_today[(nid, di)] + work_today[(nid, di1)] - 1)
+                if weights.w_adj_work > 0:
+                    obj_terms.append(weights.w_adj_work * pair)
+
+            if weights.w_triple_work > 0:
+                for idx in range(len(days) - 2):
+                    di0, di1, di2 = day_ids[idx], day_ids[idx + 1], day_ids[idx + 2]
+                    tri = model.NewBoolVar(f"tri_{nid}_{di0}")
+                    model.Add(tri <= work_today[(nid, di0)])
+                    model.Add(tri <= work_today[(nid, di1)])
+                    model.Add(tri <= work_today[(nid, di2)])
+                    model.Add(tri >= work_today[(nid, di0)] + work_today[(nid, di1)] + work_today[(nid, di2)] - 2)
+                    obj_terms.append(weights.w_triple_work * tri)
+
+    # C) Bilanciare notti tra infermieri (range max-min)
+    if weights.w_balance_nights > 0:
+        night_counts = []
+        for n in nurses:
+            c = model.NewIntVar(0, len(days), f"nights_{n.id}")
+            model.Add(c == sum(x[(n.id, di, "N")] for di in day_ids))
+            night_counts.append(c)
+        maxN = model.NewIntVar(0, len(days), "maxN")
+        minN = model.NewIntVar(0, len(days), "minN")
+        model.AddMaxEquality(maxN, night_counts)
+        model.AddMinEquality(minN, night_counts)
+        rng = model.NewIntVar(0, len(days), "rngN")
+        model.Add(rng == maxN - minN)
+        obj_terms.append(weights.w_balance_nights * rng)
+
+    # D) Bilanciare weekend/festivi (range max-min)
+    if weights.w_balance_weekend > 0:
+        weekend_days = [iso(d) for d in days if scenario.day_is_weekend_or_holiday(d)]
+        weekend_counts = []
+        for n in nurses:
+            c = model.NewIntVar(0, len(weekend_days), f"wk_{n.id}")
+            model.Add(c == sum(work_today[(n.id, di)] for di in weekend_days))
+            weekend_counts.append(c)
+        maxW = model.NewIntVar(0, len(weekend_days), "maxW")
+        minW = model.NewIntVar(0, len(weekend_days), "minW")
+        model.AddMaxEquality(maxW, weekend_counts)
+        model.AddMinEquality(minW, weekend_counts)
+        rng = model.NewIntVar(0, len(weekend_days), "rngW")
+        model.Add(rng == maxW - minW)
+        obj_terms.append(weights.w_balance_weekend * rng)
+
+    # E) Debito orario: minimizza scostamento oltre tolleranza
+    if weights.w_hours_dev > 0:
+        tol = max(0, int(scenario.rules.tolleranza_ore))
+        for n in nurses:
+            max_hours = sum(max(shift_hours.get(s, 0), 0) for s in work_states) * len(days)
+            h = model.NewIntVar(0, max_hours, f"hours_{n.id}")
+            model.Add(
+                h == sum(
+                    shift_hours["M"] * x[(n.id, di, "M")] +
+                    shift_hours["P"] * x[(n.id, di, "P")] +
+                    shift_hours["N"] * x[(n.id, di, "N")]
+                    for di in day_ids
+                )
+            )
+            target = int(n.target_ore_periodo)
+            dev_abs = model.NewIntVar(0, max_hours, f"devabs_{n.id}")
+            model.AddAbsEquality(dev_abs, h - target)
+            if tol > 0:
+                over = model.NewIntVar(0, max_hours, f"over_{n.id}")
+                # over >= dev_abs - tol ; over >= 0
+                model.Add(over >= dev_abs - tol)
+                model.Add(over >= 0)
+                obj_terms.append(weights.w_hours_dev * over)
+            else:
+                obj_terms.append(weights.w_hours_dev * dev_abs)
+
+    if obj_terms:
+        model.Minimize(sum(obj_terms))
+
+    # Risoluzione
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = float(time_limit_s)
+    solver.parameters.random_seed = int(random_seed)
+    solver.parameters.num_search_workers = 8  # parallelismo (di solito utile)
+    # solver.parameters.log_search_progress = True  # per debug
+
+    status = solver.Solve(model)
+    status_name = _status_name(status)
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        out_schedule: Dict[str, Dict[str, str]] = {nid: {} for nid in nurse_ids}
+        for nid in nurse_ids:
+            for di in day_ids:
+                # trova stato attivo
+                chosen = None
+                for s in all_states:
+                    v = x[(nid, di, s)]
+                    if solver.Value(v) == 1:
+                        chosen = s
+                        break
+                if chosen is None:
+                    chosen = "R"
+                out_schedule[nid][di] = chosen
+        return SolveResult(
+            status=status_name,
+            objective_value=int(solver.ObjectiveValue()) if obj_terms else None,
+            schedule=out_schedule,
+            diagnostics=diagnostics,
+        )
+
+    return SolveResult(status=status_name, diagnostics=diagnostics)
