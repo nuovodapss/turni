@@ -47,38 +47,75 @@ def quick_diagnostics(scenario: Scenario) -> List[str]:
     days = scenario.dates()
     nurses = scenario.nurses
     req = scenario.coverage
+
     work_states = ["M", "P", "N"]
 
-    for d in days:
-        di = iso(d)
+    def req_for_day(d: date) -> Tuple[int, int, int]:
+        """Requisiti di copertura per un giorno (applica override weekend/festivi)."""
         reqM, reqP, reqN = req.min_M, req.min_P, req.min_N
         if scenario.day_is_weekend_or_holiday(d):
             reqM = req.weekend_min_M if req.weekend_min_M is not None else reqM
             reqP = req.weekend_min_P if req.weekend_min_P is not None else reqP
             reqN = req.weekend_min_N if req.weekend_min_N is not None else reqN
+        return int(reqM), int(reqP), int(reqN)
 
+    for idx, d in enumerate(days):
+        di = iso(d)
+        reqM, reqP, reqN = req_for_day(d)
+
+        # Assenze forzate (input) e lock che fissano lavoro
         forced_abs = 0
-        locked_work = 0
         locked_counts = {"M": 0, "P": 0, "N": 0}
+        eligible_for_night_today = 0
+
         for n in nurses:
             a = scenario.absences.get(n.id, {}).get(di, "")
             if a:
                 forced_abs += 1
+
+            # eleggibilità notti (molto grossolana: se non_fa_notti o max_notti==0, non conta)
+            if (not n.non_fa_notti) and (n.max_notti is None or n.max_notti > 0) and (not a):
+                eligible_for_night_today += 1
+
+            # lock: se lockato e stato attuale è lavoro, conta
             if scenario.locks.get(n.id, {}).get(di, False):
                 s = scenario.schedule.get(n.id, {}).get(di, "R")
                 if s in work_states:
-                    locked_work += 1
                     locked_counts[s] += 1
+                # warning: lock di una assenza senza input assenza -> conflitto sicuro
+                if s in scenario.absence_codes and not a:
+                    msgs.append(
+                        f"{di}: {n.id} lockato su '{s}' ma l'assenza non è impostata in tab 'Assenze' (probabile conflitto)."
+                    )
 
+        # Check 1: richiesta totale vs disponibili (senza considerare smonto)
         available_for_work = max(0, len(nurses) - forced_abs)
         if (reqM + reqP + reqN) > available_for_work:
             msgs.append(
-                f"{di}: richiesta M+P+N={reqM+reqP+reqN} > disponibili={available_for_work} "
-                f"(assenze forzate={forced_abs})."
+                f"{di}: richiesta M+P+N={reqM+reqP+reqN} > disponibili={available_for_work} (assenze forzate={forced_abs})."
             )
-        # Se lock crea già una copertura minima "troppo bassa" per una specifica fascia (p.e. pochi M)
-        if locked_counts["M"] > 0 and locked_counts["M"] > len(nurses):
-            msgs.append(f"{di}: troppi lock su M (impossibile).")
+
+        # Check 2: con smonto post-notte, il giorno d ha almeno reqN(d-1) persone in 'S' (minimo teorico)
+        if idx >= 1:
+            _, _, prev_reqN = req_for_day(days[idx - 1])
+            available_with_smonto = max(0, len(nurses) - forced_abs - prev_reqN)
+            if (reqM + reqP + reqN) > available_with_smonto:
+                msgs.append(
+                    f"{di}: considerando smonto (almeno {prev_reqN} in S per le N del giorno prima), "
+                    f"servono {reqM+reqP+reqN} lavoratori ma ne restano ~{available_with_smonto}. "
+                    f"(Suggerimento: aumentare infermieri o ridurre coperture o ridurre N giornaliere.)"
+                )
+
+        # Check 3: notti minime vs eleggibili
+        if eligible_for_night_today < reqN:
+            msgs.append(
+                f"{di}: richieste N={reqN} ma eleggibili per N (non assenti / non_fa_notti / max_notti) = {eligible_for_night_today}."
+            )
+
+        # Check 4: lock che impongono già troppe N rispetto ai req o che bloccano risorse
+        if locked_counts["N"] > reqN:
+            msgs.append(f"{di}: lock su N={locked_counts['N']} > N richieste={reqN} (potrebbe impedire la copertura di M/P).")
+
     return msgs
 
 
@@ -182,8 +219,9 @@ def solve_schedule(
         if n.max_notti is not None:
             model.Add(sum(x[(n.id, di, "N")] for di in day_ids) <= n.max_notti)
 
-    # Smonto dopo Notte: se d è N allora d+1 deve essere S
-    # E: l'ultimo giorno non può essere N (perché non possiamo imporre S fuori orizzonte)
+    # Smonto dopo Notte: se d è N allora d+1 deve essere S.
+    # Nota Beta: sull'ultimo giorno *non* imponiamo lo smonto (cadrebbe fuori orizzonte).
+    # Questo evita infeasibility quando la copertura richiede N anche nell'ultimo giorno.
     for n in nurses:
         for idx in range(len(days) - 1):
             d = days[idx]
@@ -191,8 +229,7 @@ def solve_schedule(
             di, di1 = iso(d), iso(d1)
             # N -> S
             model.Add(x[(n.id, di1, "S")] == 1).OnlyEnforceIf(x[(n.id, di, "N")])
-        # ultimo giorno: N vietato
-        model.Add(x[(n.id, day_ids[-1], "N")] == 0)
+
 
     # Transizioni vietate (11h o regole custom): x[a] -> not x[b] il giorno dopo
     forbidden = list(scenario.rules.forbidden_transitions)
