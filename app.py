@@ -12,6 +12,7 @@ Avvio:
 from __future__ import annotations
 
 import os
+import json
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -179,6 +180,16 @@ scenarios_dir.mkdir(exist_ok=True)
 
 existing = sorted([p.name for p in scenarios_dir.glob("*.json")])
 sel = st.sidebar.selectbox("Carica da file (cartella ./scenarios)", options=[""] + existing, index=0)
+
+# In Streamlit Cloud (o in demo con repository) può essere comodo caricare un JSON dal pc.
+up = st.sidebar.file_uploader("Carica scenario JSON (upload)", type=["json"])
+if up is not None:
+    try:
+        data = json.loads(up.getvalue().decode("utf-8"))
+        st.session_state.scenario = Scenario.from_dict(data)
+        st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Errore upload JSON: {e}")
 colA, colB = st.sidebar.columns(2)
 with colA:
     if st.button("Carica selezionato", use_container_width=True, disabled=(sel == "")):
@@ -201,6 +212,15 @@ if st.sidebar.button("Salva scenario", use_container_width=True):
         st.sidebar.success(f"Salvato in: scenarios/{save_name}")
     except Exception as e:
         st.sidebar.error(f"Errore nel salvataggio: {e}")
+
+# Download (utile in cloud dove non si vede il filesystem)
+st.sidebar.download_button(
+    "Scarica scenario JSON",
+    data=json.dumps(sc.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"),
+    file_name=save_name if save_name.strip() else "scenario.json",
+    mime="application/json",
+    use_container_width=True,
+)
 
 st.sidebar.divider()
 st.sidebar.caption("Suggerimento: in demo mostra ‘Carica esempio’, poi fai REPAIR dopo aver messo alcune assenze e lock.")
@@ -247,13 +267,18 @@ with tabs[0]:
         st.info("Periodo aggiornato: matrici riallineate (baseline mantenuta per quanto possibile).")
 
     st.markdown("### Infermieri")
+    # NOTE: Streamlit data_editor fa controlli di compatibilità tra dtype pandas e column_config.
+    # Se una colonna è configurata come "testo" ma contiene interi (o viceversa) l'app va in errore.
+    # Per campi opzionali numerici (es. Max notti) usiamo il dtype "Int64" con NA.
     nurses_df = pd.DataFrame([{
-        "id": n.id,
-        "Nome": n.nome,
-        "Target ore periodo": n.target_ore_periodo,
-        "Non fa notti": n.non_fa_notti,
-        "Max notti": n.max_notti if n.max_notti is not None else "",
+        "id": str(n.id),
+        "Nome": str(n.nome),
+        "Target ore periodo": int(n.target_ore_periodo),
+        "Non fa notti": bool(n.non_fa_notti),
+        "Max notti": (n.max_notti if n.max_notti is not None else pd.NA),
     } for n in sc.nurses])
+
+    nurses_df["Max notti"] = nurses_df["Max notti"].astype("Int64")
 
     nurses_df = st.data_editor(
         nurses_df,
@@ -264,7 +289,7 @@ with tabs[0]:
             "Nome": st.column_config.TextColumn(required=True),
             "Target ore periodo": st.column_config.NumberColumn(min_value=0, step=1),
             "Non fa notti": st.column_config.CheckboxColumn(),
-            "Max notti": st.column_config.TextColumn(help="Vuoto = nessun limite"),
+            "Max notti": st.column_config.NumberColumn(min_value=0, step=1, help="Vuoto = nessun limite"),
         },
         key="nurses_editor",
     )
@@ -279,7 +304,7 @@ with tabs[0]:
         target = int(r["Target ore periodo"] or 0)
         non_notti = bool(r["Non fa notti"])
         maxn = r["Max notti"]
-        maxn = int(maxn) if str(maxn).strip().isdigit() else None
+        maxn = None if pd.isna(maxn) else int(maxn)
         new_nurses.append(Nurse(id=nid, nome=nome, target_ore_periodo=target, non_fa_notti=non_notti, max_notti=maxn))
     sc.nurses = new_nurses
     sc.ensure_matrices()
